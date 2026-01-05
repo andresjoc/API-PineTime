@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Pinetime PPG WebSocket</title>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; margin: 16px; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: end; }
+    label { display: block; font-size: 12px; opacity: .8; margin-bottom: 4px; }
+    input { padding: 8px; min-width: 260px; }
+    button { padding: 8px 12px; cursor: pointer; }
+    .status { padding: 8px 12px; border: 1px solid #ddd; border-radius: 8px; }
+    canvas { border: 1px solid #ddd; border-radius: 10px; width: 100%; max-width: 1100px; height: 320px; }
+    pre { background:#f7f7f7; padding:10px; border-radius:10px; max-width:1100px; overflow:auto; }
+    .muted { opacity: .7; font-size: 12px; }
+    .danger { border: 1px solid #f2c0c0; }
+  </style>
+</head>
+<body>
+  <h2>Pinetime PPG (WebSocket)</h2>
+
+  <div class="row">
+    <div>
+      <label>Backend (host:puerto)</label>
+      <input id="backend" value="localhost:8000" />
+      <div class="muted">Ej: localhost:8000</div>
+    </div>
+
+    <div>
+      <label>Address BLE</label>
+      <input id="address" placeholder="f2:2b:66:04:27:68" />
+      <div class="muted">Debe existir conexión persistente antes.</div>
+    </div>
+
+    <div>
+      <label>interval_ms</label>
+      <input id="interval" value="2000" style="min-width: 120px;" />
+    </div>
+
+    <div>
+      <label>char_uuid</label>
+      <input id="uuid" value="2A39" style="min-width: 120px;" />
+    </div>
+
+    <div>
+      <button id="btnConnect">Conectar</button>
+      <button id="btnDisconnect" disabled>Desconectar</button>
+      <button id="btnClear" class="danger">Limpiar buffer</button>
+    </div>
+
+    <div>
+      <label>Nombre CSV</label>
+      <input id="csvName" value="ppg_ws.csv" style="min-width: 180px;" />
+      <button id="btnDownload">Descargar CSV</button>
+      <div class="muted" id="csvInfo">0 muestras</div>
+    </div>
+
+    <div class="status" id="status">Estado: desconectado</div>
+  </div>
+
+  <h3>Gráfica</h3>
+  <canvas id="plot" width="1100" height="320"></canvas>
+  <div class="muted">
+    Se acumulan muestras y se dibujan como línea. (PPG crudo). CSV: columna <code>ppg</code> (una muestra por fila).
+  </div>
+
+  <h3>Último mensaje</h3>
+  <pre id="log">{}</pre>
+
+  <script>
+    // ====== WebSocket ======
+    let ws = null;
+
+    // ====== Buffer para graficar ======
+    const maxBuffer = 4000;
+    let buffer = [];
+
+    // ====== Datos para CSV (solo samples) ======
+    let csvRows = []; // solo int (PPG)
+
+    // ====== Canvas ======
+    const canvas = document.getElementById("plot");
+    const ctx = canvas.getContext("2d");
+
+    const statusEl = document.getElementById("status");
+    const logEl = document.getElementById("log");
+    const csvInfoEl = document.getElementById("csvInfo");
+
+    const btnConnect = document.getElementById("btnConnect");
+    const btnDisconnect = document.getElementById("btnDisconnect");
+    const btnDownload = document.getElementById("btnDownload");
+    const btnClear = document.getElementById("btnClear");
+
+    function setStatus(text) {
+      statusEl.textContent = "Estado: " + text;
+    }
+
+    function safeJsonParse(str) {
+      try { return JSON.parse(str); } catch { return null; }
+    }
+
+    function clampBuffer() {
+      if (buffer.length > maxBuffer) {
+        buffer = buffer.slice(buffer.length - maxBuffer);
+      }
+    }
+
+    function updateCsvInfo() {
+      csvInfoEl.textContent = `${csvRows.length} muestras`;
+    }
+
+    function draw() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      if (buffer.length < 2) return;
+
+      let min = Infinity, max = -Infinity;
+      for (let v of buffer) { if (v < min) min = v; if (v > max) max = v; }
+      if (max === min) max = min + 1;
+
+      const w = canvas.width, h = canvas.height;
+      const pad = 10;
+      const innerW = w - pad * 2;
+      const innerH = h - pad * 2;
+
+      // base
+      ctx.beginPath();
+      ctx.moveTo(pad, pad + innerH);
+      ctx.lineTo(pad + innerW, pad + innerH);
+      ctx.strokeStyle = "#ddd";
+      ctx.lineWidth = 1;
+      ctx.stroke();
+
+      // señal
+      ctx.beginPath();
+      for (let i = 0; i < buffer.length; i++) {
+        const x = pad + (i / (buffer.length - 1)) * innerW;
+        const norm = (buffer[i] - min) / (max - min);
+        const y = pad + (1 - norm) * innerH;
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.strokeStyle = "#111";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      ctx.fillStyle = "#333";
+      ctx.font = "12px system-ui, Arial";
+      ctx.fillText(`min=${min.toFixed(0)}  max=${max.toFixed(0)}  n=${buffer.length}`, pad, 14);
+    }
+
+    // Guardar SOLO PPG (sin tiempo)
+    function appendToCsv(newSamples) {
+      for (let i = 0; i < newSamples.length; i++) {
+        csvRows.push(newSamples[i]);
+      }
+      updateCsvInfo();
+    }
+
+    function connectWS() {
+      const backend = document.getElementById("backend").value.trim();
+      const address = document.getElementById("address").value.trim();
+      const interval = document.getElementById("interval").value.trim();
+      const uuid = document.getElementById("uuid").value.trim();
+
+      if (!backend || !address) {
+        alert("Debes poner backend y address.");
+        return;
+      }
+
+      const intervalMs = parseInt(interval || "2000", 10) || 2000;
+
+      const wsUrl =
+        `ws://${backend}/ws/ble/ppg` +
+        `?address=${encodeURIComponent(address)}` +
+        `&interval_ms=${encodeURIComponent(intervalMs)}` +
+        `&char_uuid=${encodeURIComponent(uuid)}`;
+
+      setStatus("conectando...");
+      logEl.textContent = JSON.stringify({ wsUrl }, null, 2);
+
+      ws = new WebSocket(wsUrl);
+
+      ws.onopen = () => {
+        setStatus("conectado");
+        btnConnect.disabled = true;
+        btnDisconnect.disabled = false;
+      };
+
+      ws.onmessage = (ev) => {
+        const msg = safeJsonParse(ev.data);
+        if (!msg) return;
+
+        logEl.textContent = JSON.stringify(msg, null, 2);
+
+        if (msg.error) {
+          setStatus("error: " + msg.error);
+          return;
+        }
+
+        if (Array.isArray(msg.new_samples) && msg.new_samples.length > 0) {
+          // Para gráfica
+          buffer.push(...msg.new_samples);
+          clampBuffer();
+          draw();
+
+          // Para CSV (solo samples)
+          appendToCsv(msg.new_samples);
+        }
+      };
+
+      ws.onclose = () => {
+        setStatus("desconectado");
+        btnConnect.disabled = false;
+        btnDisconnect.disabled = true;
+        ws = null;
+      };
+
+      ws.onerror = () => setStatus("error de conexión (revisa consola)");
+    }
+
+    function disconnectWS() {
+      if (ws) ws.close();
+    }
+
+    function clearAll() {
+      buffer = [];
+      csvRows = [];
+      updateCsvInfo();
+      draw();
+      logEl.textContent = "{}";
+    }
+
+    function downloadCsv() {
+      const name = (document.getElementById("csvName").value || "ppg_ws.csv").trim();
+
+      // Una sola columna: ppg
+      const lines = ["ppg"];
+      for (const s of csvRows) {
+        lines.push(String(s));
+      }
+
+      const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = name.endsWith(".csv") ? name : (name + ".csv");
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+
+      URL.revokeObjectURL(url);
+    }
+
+    btnConnect.addEventListener("click", connectWS);
+    btnDisconnect.addEventListener("click", disconnectWS);
+    btnDownload.addEventListener("click", downloadCsv);
+    btnClear.addEventListener("click", clearAll);
+
+    updateCsvInfo();
+    draw();
+  </script>
+</body>
+</html>
