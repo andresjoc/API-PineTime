@@ -51,7 +51,7 @@ Desde PowerShell:
 
 ```
 python -m venv .venv
-.venv\Scripts\Activate.ps1
+.venv\Scripts\activate
 ```
 
 ---
@@ -74,9 +74,6 @@ uvicorn main:api --host 0.0.0.0 --port 8000
 
 - Swagger UI:  
   `http://localhost:8000/docs`
-
-- OpenAPI JSON:  
-  `http://localhost:8000/openapi.json`
 
 Al apagar el servidor, todas las conexiones BLE persistentes se cierran automáticamente.
 
