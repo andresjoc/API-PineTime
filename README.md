@@ -10,6 +10,8 @@ Incluye:
 - Streaming PPG por WebSocket (incremental)
 - Cliente web HTML para visualización en tiempo real y exportación a CSV
 
+<img width="1629" height="967" alt="image" src="https://github.com/user-attachments/assets/55fc2eb5-b0e0-475c-bc42-9e764619eb98" />
+
 ---
 
 ## Requisitos (Windows)
